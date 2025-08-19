@@ -539,11 +539,22 @@ class SimpleDynamicRSLRLVecEnv(VecEnv):
         # Update episode tracking
         self.episode_length_buf += 1
         
-        # Create infos dict
+        # Track episode statistics and reset on episode end
+        reset_mask = terminated or truncated
+        episode_length = self.episode_length_buf[0].item() if reset_mask else 0
+        
+        # Reset episode tracking for terminated episodes
+        if reset_mask:
+            self.episode_length_buf.zero_()
+        
+        # Create infos dict with episode statistics
         time_outs = torch.tensor([truncated], device=self.device, dtype=torch.bool)
         infos = {
             'time_outs': time_outs,
             'episode_rewards': rewards.clone(),  # For logging
+            'goal_achieved': info.get('success', 0.0),
+            'episode_length': episode_length,
+            'distance_to_goal': info.get('distance_to_goal', 0.0),
         }
         
         # Convert observations to TensorDict
