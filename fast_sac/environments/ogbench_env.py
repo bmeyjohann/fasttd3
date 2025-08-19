@@ -236,6 +236,10 @@ class OGBenchEnv:
 
     def step(self, actions):
         assert isinstance(actions, torch.Tensor)
+        
+        # Apply action clipping for MuJoCo stability (prevents NaN/Inf values)
+        actions = torch.clamp(actions, -1.0, 1.0)
+        
         actions = actions.cpu().numpy()
 
         if self._single_env:
@@ -319,3 +323,261 @@ class OGBenchEnv:
         infos["raw_infos"] = raw_infos  # Store raw infos for debugging
 
         return observations, rewards, dones, infos
+
+
+# =============================================================================
+# RSL-RL VecEnv Wrappers for Goal Navigation Experiments
+# =============================================================================
+
+# Import dependencies for RSL-RL wrappers
+from rsl_rl.env import VecEnv
+from tensordict import TensorDict
+
+
+class OGBenchRSLRLVecEnv(VecEnv):
+    """RSL-RL VecEnv wrapper for OGBench environments with action clipping and TensorDict observations."""
+    
+    def __init__(self, env: 'OGBenchEnv', cfg: dict = None):
+        self.env = env
+        self.cfg = cfg or {}
+        
+        # Reward shaping options
+        self.reward_type = cfg.get('reward_type', 'sparse')
+        self.dense_reward_scale = cfg.get('dense_reward_scale', 0.01)
+        
+        # RSL-RL VecEnv required attributes
+        self.num_envs = env.num_envs
+        self.num_actions = env.num_actions
+        self.max_episode_length = env.max_episode_steps
+        self.device = env.sim_device
+        
+        # Episode tracking buffer (required by RSL-RL)
+        self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        
+        # Internal state
+        self._last_obs = None
+        
+        # Initialize observations
+        self.reset()
+        
+    def get_observations(self) -> TensorDict:
+        """Return current observations as TensorDict."""
+        if self._last_obs is None:
+            self.reset()
+        return self._last_obs
+    
+    def reset(self) -> TensorDict:
+        """Reset environment and return TensorDict observations."""
+        # Get enhanced observations from OGBench environment
+        raw_obs = self.env.reset()  # Shape: [num_envs, obs_dim]
+        
+        # Convert to TensorDict with proper structure for RSL-RL
+        self._last_obs = TensorDict({
+            "policy": raw_obs,  # Observations for policy network
+        }, batch_size=[self.num_envs], device=self.device)
+        
+        # Reset episode length buffer
+        self.episode_length_buf.zero_()
+        
+        return self._last_obs
+    
+    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+        """Step environment with RSL-RL interface."""
+        # Step the underlying environment (action clipping is handled in OGBenchEnv)
+        raw_obs, rewards, dones, infos = self.env.step(actions)
+        
+        # Apply reward shaping if dense
+        if self.reward_type == 'dense':
+            # The OGBench wrapper already provides enhanced observations
+            # We can add distance-based rewards here if needed
+            pass  # For now, use sparse rewards from OGBench
+        
+        # Update episode tracking
+        self.episode_length_buf += 1
+        
+        # Convert observations to TensorDict
+        obs_tensordict = TensorDict({
+            "policy": raw_obs,  # Policy observations
+        }, batch_size=[self.num_envs], device=self.device)
+        
+        # Store for get_observations()
+        self._last_obs = obs_tensordict
+        
+        # Create extras dict with required RSL-RL fields
+        time_outs = infos.get("time_outs", torch.zeros_like(dones))
+        
+        # Update infos for RSL-RL compatibility
+        rsl_infos = {
+            'time_outs': time_outs,
+            'episode_rewards': infos.get('episode_rewards', rewards.clone()),
+        }
+        
+        return obs_tensordict, rewards, dones, rsl_infos
+
+
+class SimpleDynamicRSLRLVecEnv(VecEnv):
+    """RSL-RL VecEnv wrapper for SimpleDynamicPointMaze using TensorDict observations."""
+    
+    def __init__(self, cfg: dict = None):
+        self.cfg = cfg or {}
+        
+        # Environment configuration
+        arena_size = self.cfg.get('arena_size', 20.0)
+        max_episode_steps = self.cfg.get('max_episode_steps', 500)
+        goal_threshold = self.cfg.get('goal_threshold', 0.5)
+        action_scale = self.cfg.get('action_scale', 0.5)
+        
+        # Reward configuration  
+        self.reward_type = self.cfg.get('reward_type', 'sparse')
+        if self.reward_type == 'sparse':
+            # Import here to avoid circular imports
+            from simple_dynamic_pointmaze import SimpleDynamicPointMaze
+            self.base_env = SimpleDynamicPointMaze(
+                arena_size=arena_size,
+                max_episode_steps=max_episode_steps,
+                goal_reward=1.0,
+                distance_reward_scale=0.0,  # No distance reward for sparse
+                action_scale=action_scale,
+                goal_threshold=goal_threshold,
+            )
+        else:  # dense
+            from simple_dynamic_pointmaze import SimpleDynamicPointMaze
+            self.base_env = SimpleDynamicPointMaze(
+                arena_size=arena_size,
+                max_episode_steps=max_episode_steps,
+                goal_reward=1.0,
+                distance_reward_scale=0.01,  # Distance reward for dense
+                action_scale=action_scale,
+                goal_threshold=goal_threshold,
+            )
+        
+        # RSL-RL VecEnv required attributes
+        self.num_envs = 1  # Single env for simple case
+        self.num_actions = self.base_env.action_space.shape[0]
+        self.max_episode_length = self.base_env.max_episode_steps
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Episode tracking buffer (required by RSL-RL)
+        self.episode_length_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        
+        # Internal state
+        self._last_obs = None
+        
+        # Initialize observations
+        self.reset()
+        
+    def _enhance_observation(self, raw_obs, info):
+        """Enhance simple environment observation with goal information."""
+        # raw_obs: [agent_x, agent_y]
+        # Add: [goal_x, goal_y, distance, direction_x, direction_y]
+        
+        agent_pos = raw_obs[:2]
+        goal_pos = info['goal']
+        
+        # Calculate distance
+        distance = np.linalg.norm(goal_pos - agent_pos)
+        
+        # Calculate normalized direction
+        direction = goal_pos - agent_pos
+        direction_norm = np.linalg.norm(direction)
+        if direction_norm > 0:
+            direction = direction / direction_norm
+        else:
+            direction = np.zeros(2)
+            
+        # Combine all components
+        enhanced_obs = np.concatenate([
+            agent_pos,      # [0:2] Agent position
+            goal_pos,       # [2:4] Goal position  
+            [distance],     # [4] Distance to goal
+            direction       # [5:7] Normalized direction
+        ])
+        
+        return enhanced_obs.astype(np.float32)
+        
+    def get_observations(self) -> TensorDict:
+        """Return current observations as TensorDict."""
+        if self._last_obs is None:
+            self.reset()
+        return self._last_obs
+    
+    def reset(self) -> TensorDict:
+        """Reset environment and return TensorDict observations."""
+        # Reset the simple environment
+        raw_obs, info = self.base_env.reset()
+        
+        # Enhance observation
+        enhanced_obs = self._enhance_observation(raw_obs, info)
+        obs_tensor = torch.from_numpy(enhanced_obs).unsqueeze(0).to(device=self.device, dtype=torch.float)
+        
+        # Convert to TensorDict with proper structure for RSL-RL
+        self._last_obs = TensorDict({
+            "policy": obs_tensor,  # Observations for policy network
+        }, batch_size=[self.num_envs], device=self.device)
+        
+        # Reset episode length buffer
+        self.episode_length_buf.zero_()
+        
+        return self._last_obs
+    
+    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+        """Step environment with RSL-RL interface."""
+        # Apply action clipping for stability (same as OGBenchEnv)
+        processed_actions = torch.clamp(actions, -1.0, 1.0)
+        
+        # Step the simple environment
+        raw_obs, reward, terminated, truncated, info = self.base_env.step(processed_actions[0].cpu().numpy())
+        
+        # Enhance observation
+        enhanced_obs = self._enhance_observation(raw_obs, info)
+        obs_tensor = torch.from_numpy(enhanced_obs).unsqueeze(0).to(device=self.device, dtype=torch.float)
+        
+        # Convert to tensors
+        rewards = torch.tensor([reward], device=self.device, dtype=torch.float)
+        dones = torch.tensor([terminated], device=self.device, dtype=torch.bool)
+        
+        # Update episode tracking
+        self.episode_length_buf += 1
+        
+        # Create infos dict
+        time_outs = torch.tensor([truncated], device=self.device, dtype=torch.bool)
+        infos = {
+            'time_outs': time_outs,
+            'episode_rewards': rewards.clone(),  # For logging
+        }
+        
+        # Convert observations to TensorDict
+        obs_tensordict = TensorDict({
+            "policy": obs_tensor,
+        }, batch_size=[self.num_envs], device=self.device)
+        
+        self._last_obs = obs_tensordict
+        
+        return obs_tensordict, rewards, dones, infos
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def _log_to_csv(log_data, experiment_name):
+    """Backup CSV logging for when wandb is offline."""
+    import csv
+    from pathlib import Path
+    
+    # Create logs directory if it doesn't exist
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    csv_file = log_dir / f"{experiment_name}_metrics.csv"
+    
+    # Check if file exists to write headers
+    write_header = not csv_file.exists()
+    
+    with open(csv_file, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=log_data.keys())
+        
+        if write_header:
+            writer.writeheader()
+        
+        writer.writerow(log_data)
