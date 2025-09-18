@@ -56,9 +56,15 @@ class OGBenchVecEnvAdapter:
                 }
             },
         }
-        # Add applied actions tensor when available
-        if "applied_actions" in extras:
-            infos["applied_actions"] = extras["applied_actions"].to(self.device)
+        # Add common extras tensors when available
+        for k in ("applied_actions", "student_actions", "teacher_actions", "teacher_intervened_mask"):
+            if k in extras:
+                v = extras[k]
+                try:
+                    v = v.to(self.device)
+                except Exception:
+                    pass
+                infos[k] = v
         # Pass through episode logs if present for RSL-RL style logging
         if "log" in extras:
             infos["log"] = extras["log"]
