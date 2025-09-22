@@ -26,6 +26,7 @@ class OGBenchVecEnvAdapter:
             num_envs=num_envs,
             wrappers=wrappers or [],
             clip_actions=clip_actions,
+            auto_reset_on_init=False,
             **env_kwargs,
         )
         # Mirror attributes expected by fast_sac
