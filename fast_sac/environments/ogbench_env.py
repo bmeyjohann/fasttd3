@@ -21,10 +21,13 @@ class OGBenchVecEnvAdapter:
         **env_kwargs,
     ):
         self.device = device
+        self.env_name = env_name
+        self._wrappers = wrappers or []
+        self._env_kwargs = env_kwargs
         self._env = VectorizedOGBenchEnv(
             env_name=env_name,
             num_envs=num_envs,
-            wrappers=wrappers or [],
+            wrappers=self._wrappers,
             clip_actions=clip_actions,
             auto_reset_on_init=False,
             **env_kwargs,
@@ -39,6 +42,31 @@ class OGBenchVecEnvAdapter:
     def reset(self) -> torch.Tensor:
         obs_td, _ = self._env.reset()
         return obs_td["policy"].to(self.device)
+
+    def switch_env(
+        self,
+        env_name: str,
+        wrappers: Optional[List[Callable]] = None,
+        curriculum_steps: Optional[int] = None,
+        **env_kwargs,
+    ):
+        """Rebuild the underlying vector env with a new environment id."""
+        if wrappers is None:
+            wrappers = self._wrappers
+        else:
+            self._wrappers = wrappers
+        if env_kwargs:
+            self._env_kwargs = env_kwargs
+        else:
+            env_kwargs = self._env_kwargs
+
+        self._env.switch_env(env_name, wrappers=wrappers, curriculum_steps=curriculum_steps, **env_kwargs)
+        self.env_name = env_name
+        self.num_obs = self._env.num_obs
+        self.num_actions = self._env.num_actions
+        self.max_episode_steps = self._env.max_episode_length
+        # Reset returns the first observation batch from the reconstructed env
+        return self.reset()
 
     def step(self, actions: torch.Tensor):
         if not isinstance(actions, torch.Tensor):
