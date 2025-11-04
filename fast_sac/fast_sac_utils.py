@@ -1,4 +1,5 @@
 import os
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,16 +20,14 @@ class SimpleReplayBuffer(nn.Module):
         n_steps: int = 1,
         gamma: float = 0.99,
         device=None,
+        pixel_shape: Optional[Tuple[int, int, int]] = None,
     ):
         """
-        A simple replay buffer that stores transitions in a circular buffer.
-        Supports n-step returns and asymmetric observations.
+        Replay buffer that keeps data on CPU and only stages sampled minibatches onto the
+        training device. Designed for pixel observations: stores uint8 frames, applies
+        DrQ-style next-observation indexing, and avoids redundant next-frame copies.
 
-        When playground_mode=True, critic_observations are treated as a concatenation of
-        regular observations and privileged observations, and only the privileged part is stored
-        to save memory.
-
-        TODO (Younggyo): Refactor to split this into SimpleReplayBuffer and NStepReplayBuffer
+        Note: only 1-step returns are currently supported.
         """
         super().__init__()
 
@@ -41,356 +40,286 @@ class SimpleReplayBuffer(nn.Module):
         self.playground_mode = playground_mode and asymmetric_obs
         self.gamma = gamma
         self.n_steps = n_steps
-        self.device = device
-
-        self.observations = torch.zeros(
-            (n_env, buffer_size, n_obs), device=device, dtype=torch.float
-        )
-        self.actions = torch.zeros(
-            (n_env, buffer_size, n_act), device=device, dtype=torch.float
-        )
-        self.rewards = torch.zeros(
-            (n_env, buffer_size), device=device, dtype=torch.float
-        )
-        self.dones = torch.zeros((n_env, buffer_size), device=device, dtype=torch.long)
-        self.truncations = torch.zeros(
-            (n_env, buffer_size), device=device, dtype=torch.long
-        )
-        self.next_observations = torch.zeros(
-            (n_env, buffer_size, n_obs), device=device, dtype=torch.float
-        )
-        if asymmetric_obs:
-            if self.playground_mode:
-                # Only store the privileged part of observations (n_critic_obs - n_obs)
-                self.privileged_obs_size = n_critic_obs - n_obs
-                self.privileged_observations = torch.zeros(
-                    (n_env, buffer_size, self.privileged_obs_size),
-                    device=device,
-                    dtype=torch.float,
+        self.storage_device = torch.device("cpu")
+        self.sample_device = torch.device(device) if device is not None else torch.device("cpu")
+        self.pixel_shape = pixel_shape if pixel_shape is not None else None
+        self.obs_is_pixel = self.pixel_shape is not None
+        if self.obs_is_pixel:
+            expected = int(self.pixel_shape[0] * self.pixel_shape[1] * self.pixel_shape[2])
+            if expected != n_obs:
+                raise ValueError(
+                    f"Pixel shape {self.pixel_shape} does not match flattened size {n_obs}"
                 )
-                self.next_privileged_observations = torch.zeros(
-                    (n_env, buffer_size, self.privileged_obs_size),
-                    device=device,
-                    dtype=torch.float,
-                )
-            else:
-                # Store full critic observations
-                self.critic_observations = torch.zeros(
-                    (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
-                )
-                self.next_critic_observations = torch.zeros(
-                    (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
-                )
-        self.ptr = 0
-
-    def extend(
-        self,
-        tensor_dict: TensorDict,
-    ):
-        observations = tensor_dict["observations"]
-        actions = tensor_dict["actions"]
-        rewards = tensor_dict["next"]["rewards"]
-        dones = tensor_dict["next"]["dones"]
-        truncations = tensor_dict["next"]["truncations"]
-        next_observations = tensor_dict["next"]["observations"]
-
-        ptr = self.ptr % self.buffer_size
-        self.observations[:, ptr] = observations
-        self.actions[:, ptr] = actions
-        self.rewards[:, ptr] = rewards
-        self.dones[:, ptr] = dones
-        self.truncations[:, ptr] = truncations
-        self.next_observations[:, ptr] = next_observations
-        if self.asymmetric_obs:
-            critic_observations = tensor_dict["critic_observations"]
-            next_critic_observations = tensor_dict["next"]["critic_observations"]
-
-            if self.playground_mode:
-                # Extract and store only the privileged part
-                privileged_observations = critic_observations[:, self.n_obs :]
-                next_privileged_observations = next_critic_observations[:, self.n_obs :]
-                self.privileged_observations[:, ptr] = privileged_observations
-                self.next_privileged_observations[:, ptr] = next_privileged_observations
-            else:
-                # Store full critic observations
-                self.critic_observations[:, ptr] = critic_observations
-                self.next_critic_observations[:, ptr] = next_critic_observations
-        self.ptr += 1
-
-    def sample(self, batch_size: int):
-        # we will sample n_env * batch_size transitions
-
-        if self.n_steps == 1:
-            indices = torch.randint(
-                0,
-                min(self.buffer_size, self.ptr),
-                (self.n_env, batch_size),
-                device=self.device,
-            )
-            obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
-            act_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_act)
-            observations = torch.gather(self.observations, 1, obs_indices).reshape(
-                self.n_env * batch_size, self.n_obs
-            )
-            next_observations = torch.gather(
-                self.next_observations, 1, obs_indices
-            ).reshape(self.n_env * batch_size, self.n_obs)
-            actions = torch.gather(self.actions, 1, act_indices).reshape(
-                self.n_env * batch_size, self.n_act
-            )
-
-            rewards = torch.gather(self.rewards, 1, indices).reshape(
-                self.n_env * batch_size
-            )
-            dones = torch.gather(self.dones, 1, indices).reshape(
-                self.n_env * batch_size
-            )
-            truncations = torch.gather(self.truncations, 1, indices).reshape(
-                self.n_env * batch_size
-            )
-            effective_n_steps = torch.ones_like(dones)
-            if self.asymmetric_obs:
-                if self.playground_mode:
-                    # Gather privileged observations
-                    priv_obs_indices = indices.unsqueeze(-1).expand(
-                        -1, -1, self.privileged_obs_size
-                    )
-                    privileged_observations = torch.gather(
-                        self.privileged_observations, 1, priv_obs_indices
-                    ).reshape(self.n_env * batch_size, self.privileged_obs_size)
-                    next_privileged_observations = torch.gather(
-                        self.next_privileged_observations, 1, priv_obs_indices
-                    ).reshape(self.n_env * batch_size, self.privileged_obs_size)
-
-                    # Concatenate with regular observations to form full critic observations
-                    critic_observations = torch.cat(
-                        [observations, privileged_observations], dim=1
-                    )
-                    next_critic_observations = torch.cat(
-                        [next_observations, next_privileged_observations], dim=1
-                    )
-                else:
-                    # Gather full critic observations
-                    critic_obs_indices = indices.unsqueeze(-1).expand(
-                        -1, -1, self.n_critic_obs
-                    )
-                    critic_observations = torch.gather(
-                        self.critic_observations, 1, critic_obs_indices
-                    ).reshape(self.n_env * batch_size, self.n_critic_obs)
-                    next_critic_observations = torch.gather(
-                        self.next_critic_observations, 1, critic_obs_indices
-                    ).reshape(self.n_env * batch_size, self.n_critic_obs)
+            self.obs_storage_shape: Sequence[int] = self.pixel_shape
+            self.obs_flat_dim = expected
+            self.obs_dtype = torch.uint8
         else:
-            # Sample base indices
-            if self.ptr >= self.buffer_size:
-                # When the buffer is full, there is no protection against sampling across different episodes
-                # We avoid this by temporarily setting self.pos - 1 to truncated = True if not done
-                # https://github.com/DLR-RM/stable-baselines3/blob/b91050ca94f8bce7a0285c91f85da518d5a26223/stable_baselines3/common/buffers.py#L857-L860
-                # TODO (Younggyo): Change the reference when this SB3 branch is merged
-                current_pos = self.ptr % self.buffer_size
-                curr_truncations = self.truncations[:, current_pos - 1].clone()
-                self.truncations[:, current_pos - 1] = torch.logical_not(
-                    self.dones[:, current_pos - 1]
-                )
-                indices = torch.randint(
-                    0,
-                    self.buffer_size,
-                    (self.n_env, batch_size),
-                    device=self.device,
+            self.obs_storage_shape = (n_obs,)
+            self.obs_flat_dim = n_obs
+            self.obs_dtype = torch.float32
+
+        if self.n_steps != 1:
+            raise NotImplementedError("SimpleReplayBuffer currently supports n_steps == 1 only.")
+
+        base_cap = buffer_size // max(1, n_env)
+        if base_cap == 0:
+            raise ValueError("buffer_size must be at least num_envs to allocate per-env storage.")
+        remainder = buffer_size % n_env
+        self.env_capacities = [base_cap + (1 if idx < remainder else 0) for idx in range(n_env)]
+        self.max_capacity = max(self.env_capacities)
+        self.capacity = sum(self.env_capacities)
+
+        obs_shape = (n_env, self.max_capacity, *self.obs_storage_shape)
+        self.observations = torch.empty(obs_shape, dtype=self.obs_dtype, device=self.storage_device)
+        if self.obs_is_pixel:
+            self.observations.zero_()
+
+        self.actions = torch.empty(
+            (n_env, self.max_capacity, n_act), dtype=torch.float32, device=self.storage_device
+        )
+        self.rewards = torch.empty((n_env, self.max_capacity), dtype=torch.float32, device=self.storage_device)
+        self.dones = torch.empty((n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device)
+        self.truncations = torch.empty((n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device)
+
+        self.transition_ready = torch.zeros(
+            (n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device
+        )
+        self.valid_next_mask = torch.zeros(
+            (n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device
+        )
+
+        if self.asymmetric_obs:
+            if self.playground_mode:
+                self.privileged_obs_size = n_critic_obs - n_obs
+                if self.privileged_obs_size <= 0:
+                    raise ValueError("playground_mode requires n_critic_obs > n_obs")
+                self.privileged_observations = torch.empty(
+                    (n_env, self.max_capacity, self.privileged_obs_size),
+                    dtype=torch.float32,
+                    device=self.storage_device,
                 )
             else:
-                # Buffer not full - ensure n-step sequence doesn't exceed valid data
-                max_start_idx = max(1, self.ptr - self.n_steps + 1)
-                indices = torch.randint(
-                    0,
-                    max_start_idx,
-                    (self.n_env, batch_size),
-                    device=self.device,
+                self.critic_observations = torch.empty(
+                    (n_env, self.max_capacity, n_critic_obs),
+                    dtype=torch.float32,
+                    device=self.storage_device,
                 )
-            obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
-            act_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_act)
 
-            # Get base transitions
-            observations = torch.gather(self.observations, 1, obs_indices).reshape(
-                self.n_env * batch_size, self.n_obs
-            )
-            actions = torch.gather(self.actions, 1, act_indices).reshape(
-                self.n_env * batch_size, self.n_act
-            )
-            if self.asymmetric_obs:
-                if self.playground_mode:
-                    # Gather privileged observations
-                    priv_obs_indices = indices.unsqueeze(-1).expand(
-                        -1, -1, self.privileged_obs_size
-                    )
-                    privileged_observations = torch.gather(
-                        self.privileged_observations, 1, priv_obs_indices
-                    ).reshape(self.n_env * batch_size, self.privileged_obs_size)
+        self.env_ptr = torch.zeros(n_env, dtype=torch.long)
+        self.filled = torch.zeros(n_env, dtype=torch.long)
+        self.ptr = 0
+        self.size = 0
 
-                    # Concatenate with regular observations to form full critic observations
-                    critic_observations = torch.cat(
-                        [observations, privileged_observations], dim=1
-                    )
-                else:
-                    # Gather full critic observations
-                    critic_obs_indices = indices.unsqueeze(-1).expand(
-                        -1, -1, self.n_critic_obs
-                    )
-                    critic_observations = torch.gather(
-                        self.critic_observations, 1, critic_obs_indices
-                    ).reshape(self.n_env * batch_size, self.n_critic_obs)
+    def _store_observation(self, env_idx: int, slot: int, obs_tensor: torch.Tensor) -> None:
+        if self.obs_is_pixel:
+            obs_uint8 = obs_tensor.mul(255.0).clamp_(0, 255).to(torch.uint8)
+            self.observations[env_idx, slot].copy_(obs_uint8)
+        else:
+            self.observations[env_idx, slot].copy_(obs_tensor.to(torch.float32))
 
-            # Create sequential indices for each sample
-            # This creates a [n_env, batch_size, n_step] tensor of indices
-            seq_offsets = torch.arange(self.n_steps, device=self.device).view(1, 1, -1)
-            all_indices = (
-                indices.unsqueeze(-1) + seq_offsets
-            ) % self.buffer_size  # [n_env, batch_size, n_step]
+    @staticmethod
+    def _pin_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type != "cpu":
+            return tensor
+        try:
+            return tensor.pin_memory()
+        except RuntimeError:
+            return tensor
 
-            # Gather all rewards and terminal flags
-            # Using advanced indexing - result shapes: [n_env, batch_size, n_step]
-            all_rewards = torch.gather(
-                self.rewards.unsqueeze(-1).expand(-1, -1, self.n_steps), 1, all_indices
-            )
-            all_dones = torch.gather(
-                self.dones.unsqueeze(-1).expand(-1, -1, self.n_steps), 1, all_indices
-            )
-            all_truncations = torch.gather(
-                self.truncations.unsqueeze(-1).expand(-1, -1, self.n_steps),
-                1,
-                all_indices,
-            )
+    def extend(self, tensor_dict: TensorDict) -> None:
+        observations = tensor_dict["observations"].detach().to(self.storage_device, non_blocking=True)
+        next_observations = tensor_dict["next"]["observations"].detach().to(self.storage_device, non_blocking=True)
+        actions = tensor_dict["actions"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
+        rewards = tensor_dict["next"]["rewards"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
+        dones = tensor_dict["next"]["dones"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+        truncations = (
+            tensor_dict["next"]["truncations"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+        )
 
-            # Create masks for rewards *after* first done
-            # This creates a cumulative product that zeroes out rewards after the first done
-            all_dones_shifted = torch.cat(
-                [torch.zeros_like(all_dones[:, :, :1]), all_dones[:, :, :-1]], dim=2
-            )  # First reward should not be masked
-            done_masks = torch.cumprod(
-                1.0 - all_dones_shifted, dim=2
-            )  # [n_env, batch_size, n_step]
-            effective_n_steps = done_masks.sum(2)
+        if self.obs_is_pixel:
+            observations = observations.view(self.n_env, *self.pixel_shape)
+            next_observations = next_observations.view(self.n_env, *self.pixel_shape)
+        else:
+            observations = observations.view(self.n_env, self.obs_flat_dim)
+            next_observations = next_observations.view(self.n_env, self.obs_flat_dim)
 
-            # Create discount factors
-            discounts = torch.pow(
-                self.gamma, torch.arange(self.n_steps, device=self.device)
-            )  # [n_steps]
+        if self.asymmetric_obs:
+            if self.playground_mode:
+                critic_obs = tensor_dict["critic_observations"].detach().to(self.storage_device, non_blocking=True)
+                next_critic_obs = tensor_dict["next"]["critic_observations"].detach().to(
+                    self.storage_device, non_blocking=True
+                )
+                critic_obs = critic_obs.view(self.n_env, -1)[:, self.n_obs :]
+                next_critic_obs = next_critic_obs.view(self.n_env, -1)[:, self.n_obs :]
+            else:
+                critic_obs = tensor_dict["critic_observations"].detach().to(self.storage_device, non_blocking=True)
+                next_critic_obs = tensor_dict["next"]["critic_observations"].detach().to(
+                    self.storage_device, non_blocking=True
+                )
+                critic_obs = critic_obs.view(self.n_env, -1)
+                next_critic_obs = next_critic_obs.view(self.n_env, -1)
 
-            # Apply masks and discounts to rewards
-            masked_rewards = all_rewards * done_masks  # [n_env, batch_size, n_step]
-            discounted_rewards = masked_rewards * discounts.view(
-                1, 1, -1
-            )  # [n_env, batch_size, n_step]
+        for env_idx in range(self.n_env):
+            cap = self.env_capacities[env_idx]
+            if cap <= 1:
+                continue
 
-            # Sum rewards along the n_step dimension
-            n_step_rewards = discounted_rewards.sum(dim=2)  # [n_env, batch_size]
+            ptr = int(self.env_ptr[env_idx].item())
+            next_slot = (ptr + 1) % cap
 
-            # Find index of first done or truncation or last step for each sequence
-            first_done = torch.argmax(
-                (all_dones > 0).float(), dim=2
-            )  # [n_env, batch_size]
-            first_trunc = torch.argmax(
-                (all_truncations > 0).float(), dim=2
-            )  # [n_env, batch_size]
-
-            # Handle case where there are no dones or truncations
-            no_dones = all_dones.sum(dim=2) == 0
-            no_truncs = all_truncations.sum(dim=2) == 0
-
-            # When no dones or truncs, use the last index
-            first_done = torch.where(no_dones, self.n_steps - 1, first_done)
-            first_trunc = torch.where(no_truncs, self.n_steps - 1, first_trunc)
-
-            # Take the minimum (first) of done or truncation
-            final_indices = torch.minimum(
-                first_done, first_trunc
-            )  # [n_env, batch_size]
-
-            # Create indices to gather the final next observations
-            final_next_obs_indices = torch.gather(
-                all_indices, 2, final_indices.unsqueeze(-1)
-            ).squeeze(
-                -1
-            )  # [n_env, batch_size]
-
-            # Gather final values
-            final_next_observations = self.next_observations.gather(
-                1, final_next_obs_indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
-            )
-            final_dones = self.dones.gather(1, final_next_obs_indices)
-            final_truncations = self.truncations.gather(1, final_next_obs_indices)
+            self._store_observation(env_idx, ptr, observations[env_idx])
+            self.actions[env_idx, ptr].copy_(actions[env_idx])
+            self.rewards[env_idx, ptr] = rewards[env_idx]
+            self.dones[env_idx, ptr] = dones[env_idx]
+            self.truncations[env_idx, ptr] = truncations[env_idx]
+            self.transition_ready[env_idx, ptr] = True
 
             if self.asymmetric_obs:
                 if self.playground_mode:
-                    # Gather final privileged observations
-                    final_next_privileged_observations = (
-                        self.next_privileged_observations.gather(
-                            1,
-                            final_next_obs_indices.unsqueeze(-1).expand(
-                                -1, -1, self.privileged_obs_size
-                            ),
-                        )
-                    )
-
-                    # Reshape for output
-                    next_privileged_observations = (
-                        final_next_privileged_observations.reshape(
-                            self.n_env * batch_size, self.privileged_obs_size
-                        )
-                    )
-
-                    # Concatenate with next observations to form full next critic observations
-                    next_observations_reshaped = final_next_observations.reshape(
-                        self.n_env * batch_size, self.n_obs
-                    )
-                    next_critic_observations = torch.cat(
-                        [next_observations_reshaped, next_privileged_observations],
-                        dim=1,
-                    )
+                    self.privileged_observations[env_idx, ptr].copy_(critic_obs[env_idx])
                 else:
-                    # Gather final next critic observations directly
-                    final_next_critic_observations = (
-                        self.next_critic_observations.gather(
-                            1,
-                            final_next_obs_indices.unsqueeze(-1).expand(
-                                -1, -1, self.n_critic_obs
-                            ),
-                        )
-                    )
-                    next_critic_observations = final_next_critic_observations.reshape(
-                        self.n_env * batch_size, self.n_critic_obs
-                    )
+                    self.critic_observations[env_idx, ptr].copy_(critic_obs[env_idx])
 
-            # Reshape everything to batch dimension
-            rewards = n_step_rewards.reshape(self.n_env * batch_size)
-            dones = final_dones.reshape(self.n_env * batch_size)
-            truncations = final_truncations.reshape(self.n_env * batch_size)
-            effective_n_steps = effective_n_steps.reshape(self.n_env * batch_size)
-            next_observations = final_next_observations.reshape(
-                self.n_env * batch_size, self.n_obs
+            self._store_observation(env_idx, next_slot, next_observations[env_idx])
+            self.valid_next_mask[env_idx, ptr] = True
+            self.transition_ready[env_idx, next_slot] = False
+            self.valid_next_mask[env_idx, next_slot] = False
+
+            if self.asymmetric_obs:
+                if self.playground_mode:
+                    self.privileged_observations[env_idx, next_slot].copy_(next_critic_obs[env_idx])
+                else:
+                    self.critic_observations[env_idx, next_slot].copy_(next_critic_obs[env_idx])
+
+            self.env_ptr[env_idx] = next_slot
+            if self.filled[env_idx] < cap:
+                self.filled[env_idx] += 1
+
+        self.ptr += self.n_env
+        self.size = min(self.capacity, int(self.filled.sum().item()))
+
+    def _gather_observations(self, env_idx: int, indices: torch.Tensor) -> torch.Tensor:
+        obs = self.observations[env_idx, indices]
+        if self.obs_is_pixel:
+            obs = obs.to(torch.float32).div_(255.0)
+            return obs.view(obs.shape[0], -1)
+        return obs.to(torch.float32)
+
+    def _gather_critic_observations(self, env_idx: int, indices: torch.Tensor) -> torch.Tensor:
+        if not self.asymmetric_obs:
+            raise RuntimeError("critic observations requested but asymmetric_obs=False")
+        if self.playground_mode:
+            priv = self.privileged_observations[env_idx, indices].to(torch.float32)
+            obs = self._gather_observations(env_idx, indices)
+            return torch.cat([obs, priv], dim=-1)
+        return self.critic_observations[env_idx, indices].to(torch.float32)
+
+    def sample(self, batch_size: int) -> TensorDict:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+
+        obs_batches = []
+        next_obs_batches = []
+        action_batches = []
+        reward_batches = []
+        done_batches = []
+        trunc_batches = []
+        critic_obs_batches = [] if self.asymmetric_obs else None
+        critic_next_batches = [] if self.asymmetric_obs else None
+
+        for env_idx in range(self.n_env):
+            cap = self.env_capacities[env_idx]
+            if cap <= 1 or self.filled[env_idx] <= 0:
+                continue
+
+            valid_mask = self.transition_ready[env_idx, :cap] & self.valid_next_mask[env_idx, :cap]
+            valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+            if valid_indices.numel() == 0:
+                continue
+
+            sample_ids = torch.randint(
+                0, valid_indices.numel(), (batch_size,), device=self.storage_device
             )
+            idx = valid_indices.index_select(0, sample_ids)
+            next_idx = (idx + 1) % cap
 
+            obs_batches.append(self._gather_observations(env_idx, idx))
+            next_obs_batches.append(self._gather_observations(env_idx, next_idx))
+            action_batches.append(self.actions[env_idx, idx].to(torch.float32))
+            reward_batches.append(self.rewards[env_idx, idx])
+            done_batches.append(self.dones[env_idx, idx].to(torch.bool))
+            trunc_batches.append(self.truncations[env_idx, idx].to(torch.bool))
+
+            if self.asymmetric_obs:
+                critic_obs_batches.append(self._gather_critic_observations(env_idx, idx))
+                critic_next_batches.append(self._gather_critic_observations(env_idx, next_idx))
+
+        if not obs_batches:
+            raise RuntimeError("Replay buffer does not contain enough valid transitions to sample.")
+
+        observations_cpu = self._pin_tensor(torch.cat(obs_batches, dim=0))
+        next_observations_cpu = self._pin_tensor(torch.cat(next_obs_batches, dim=0))
+        actions_cpu = self._pin_tensor(torch.cat(action_batches, dim=0))
+        rewards_cpu = self._pin_tensor(torch.cat(reward_batches, dim=0))
+        dones_cpu = self._pin_tensor(torch.cat(done_batches, dim=0))
+        trunc_cpu = self._pin_tensor(torch.cat(trunc_batches, dim=0))
+        effective_steps_cpu = self._pin_tensor(torch.ones_like(dones_cpu, dtype=torch.float32))
+
+        if self.sample_device.type == "cpu":
+            observations = observations_cpu
+            next_observations = next_observations_cpu
+            actions = actions_cpu
+            rewards = rewards_cpu
+            dones = dones_cpu
+            truncations = trunc_cpu
+            effective_steps = effective_steps_cpu
+            if self.asymmetric_obs:
+                critic_observations = self._pin_tensor(torch.cat(critic_obs_batches, dim=0))
+                critic_next_observations = self._pin_tensor(torch.cat(critic_next_batches, dim=0))
+            else:
+                critic_observations = None
+                critic_next_observations = None
+        else:
+            observations = observations_cpu.to(self.sample_device, non_blocking=True)
+            next_observations = next_observations_cpu.to(self.sample_device, non_blocking=True)
+            actions = actions_cpu.to(self.sample_device, non_blocking=True)
+            rewards = rewards_cpu.to(self.sample_device, non_blocking=True)
+            dones = dones_cpu.to(self.sample_device, non_blocking=True)
+            truncations = trunc_cpu.to(self.sample_device, non_blocking=True)
+            effective_steps = effective_steps_cpu.to(self.sample_device, non_blocking=True)
+            if self.asymmetric_obs:
+                critic_observations = self._pin_tensor(torch.cat(critic_obs_batches, dim=0)).to(
+                    self.sample_device, non_blocking=True
+                )
+                critic_next_observations = self._pin_tensor(torch.cat(critic_next_batches, dim=0)).to(
+                    self.sample_device, non_blocking=True
+                )
+            else:
+                critic_observations = None
+                critic_next_observations = None
+
+        batch_size_total = observations.shape[0]
+        next_tensordict = TensorDict(
+            {
+                "observations": next_observations,
+                "rewards": rewards,
+                "dones": dones.long(),
+                "truncations": truncations.long(),
+                "effective_n_steps": effective_steps,
+            },
+            batch_size=batch_size_total,
+        )
         out = TensorDict(
             {
                 "observations": observations,
                 "actions": actions,
-                "next": {
-                    "rewards": rewards,
-                    "dones": dones,
-                    "truncations": truncations,
-                    "observations": next_observations,
-                    "effective_n_steps": effective_n_steps,
-                },
+                "next": next_tensordict,
             },
-            batch_size=self.n_env * batch_size,
+            batch_size=batch_size_total,
         )
-        if self.asymmetric_obs:
+        if self.asymmetric_obs and critic_observations is not None and critic_next_observations is not None:
             out["critic_observations"] = critic_observations
-            out["next"]["critic_observations"] = next_critic_observations
-
-        if self.n_steps > 1 and self.ptr >= self.buffer_size:
-            # Roll back the truncation flags introduced for safe sampling
-            self.truncations[:, current_pos - 1] = curr_truncations
+            out["next"]["critic_observations"] = critic_next_observations
         return out
 
 
