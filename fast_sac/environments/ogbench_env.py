@@ -94,6 +94,9 @@ class OGBenchVecEnvAdapter:
                 except Exception:
                     pass
                 infos[k] = v
+        for k in ("episode_rewards", "episode_lengths", "goals_reached", "distances_to_goal", "lethal_terminations"):
+            if k in extras:
+                infos[k] = extras[k]
         # Pass through episode logs if present for RSL-RL style logging
         if "log" in extras:
             infos["log"] = extras["log"]
