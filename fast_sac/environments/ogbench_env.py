@@ -101,3 +101,7 @@ class OGBenchVecEnvAdapter:
         if "log" in extras:
             infos["log"] = extras["log"]
         return next_obs, rewards, dones, infos
+
+    def close(self) -> None:
+        if hasattr(self._env, "close"):
+            self._env.close()
