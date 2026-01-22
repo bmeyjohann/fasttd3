@@ -77,7 +77,7 @@ class OGBenchVecEnvAdapter:
         dones = dones.to(self.device)
         # Conform to fast_sac infos shape
         infos = {
-            "time_outs": torch.zeros_like(dones, device=self.device, dtype=torch.long),
+            "time_outs": extras.get("timeouts", torch.zeros_like(dones, device=self.device, dtype=torch.long)),
             "observations": {
                 "raw": {
                     # Provide raw obs fallback (we supply next_obs here)
@@ -94,7 +94,14 @@ class OGBenchVecEnvAdapter:
                 except Exception:
                     pass
                 infos[k] = v
-        for k in ("episode_rewards", "episode_lengths", "goals_reached", "distances_to_goal", "lethal_terminations"):
+        for k in (
+            "episode_rewards",
+            "episode_lengths",
+            "goals_reached",
+            "distances_to_goal",
+            "lethal_terminations",
+            "timeouts",
+        ):
             if k in extras:
                 infos[k] = extras[k]
         # Pass through episode logs if present for RSL-RL style logging
