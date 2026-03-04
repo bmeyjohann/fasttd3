@@ -77,6 +77,15 @@ class SimpleReplayBuffer(nn.Module):
         self.actions = torch.empty(
             (n_env, self.max_capacity, n_act), dtype=torch.float32, device=self.storage_device
         )
+        # Optional student-proposed actions for linked preference optimization.
+        # When not provided by caller, these are set equal to executed actions.
+        self.student_actions = torch.empty(
+            (n_env, self.max_capacity, n_act), dtype=torch.float32, device=self.storage_device
+        )
+        # Optional intervention marker (True when executed action differs from student intent).
+        self.teacher_intervened = torch.zeros(
+            (n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device
+        )
         self.rewards = torch.empty((n_env, self.max_capacity), dtype=torch.float32, device=self.storage_device)
         self.dones = torch.empty((n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device)
         self.truncations = torch.empty((n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device)
@@ -130,6 +139,32 @@ class SimpleReplayBuffer(nn.Module):
         observations = tensor_dict["observations"].detach().to(self.storage_device, non_blocking=True)
         next_observations = tensor_dict["next"]["observations"].detach().to(self.storage_device, non_blocking=True)
         actions = tensor_dict["actions"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
+        has_student_actions = False
+        try:
+            has_student_actions = "student_actions" in tensor_dict.keys(include_nested=False)
+        except TypeError:
+            has_student_actions = "student_actions" in tensor_dict.keys()
+        except Exception:
+            has_student_actions = "student_actions" in tensor_dict
+        if has_student_actions:
+            student_actions = (
+                tensor_dict["student_actions"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
+            )
+        else:
+            student_actions = actions
+        has_teacher_intervened = False
+        try:
+            has_teacher_intervened = "teacher_intervened" in tensor_dict.keys(include_nested=False)
+        except TypeError:
+            has_teacher_intervened = "teacher_intervened" in tensor_dict.keys()
+        except Exception:
+            has_teacher_intervened = "teacher_intervened" in tensor_dict
+        if has_teacher_intervened:
+            teacher_intervened = (
+                tensor_dict["teacher_intervened"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+            )
+        else:
+            teacher_intervened = torch.zeros(actions.shape[0], dtype=torch.bool, device=self.storage_device)
         rewards = tensor_dict["next"]["rewards"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
         dones = tensor_dict["next"]["dones"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
         truncations = (
@@ -169,6 +204,8 @@ class SimpleReplayBuffer(nn.Module):
 
             self._store_observation(env_idx, ptr, observations[env_idx])
             self.actions[env_idx, ptr].copy_(actions[env_idx])
+            self.student_actions[env_idx, ptr].copy_(student_actions[env_idx])
+            self.teacher_intervened[env_idx, ptr] = teacher_intervened[env_idx]
             self.rewards[env_idx, ptr] = rewards[env_idx]
             self.dones[env_idx, ptr] = dones[env_idx]
             self.truncations[env_idx, ptr] = truncations[env_idx]
@@ -221,6 +258,8 @@ class SimpleReplayBuffer(nn.Module):
         obs_batches = []
         next_obs_batches = []
         action_batches = []
+        student_action_batches = []
+        teacher_intervened_batches = []
         reward_batches = []
         done_batches = []
         trunc_batches = []
@@ -246,6 +285,8 @@ class SimpleReplayBuffer(nn.Module):
             obs_batches.append(self._gather_observations(env_idx, idx))
             next_obs_batches.append(self._gather_observations(env_idx, next_idx))
             action_batches.append(self.actions[env_idx, idx].to(torch.float32))
+            student_action_batches.append(self.student_actions[env_idx, idx].to(torch.float32))
+            teacher_intervened_batches.append(self.teacher_intervened[env_idx, idx].to(torch.bool))
             reward_batches.append(self.rewards[env_idx, idx])
             done_batches.append(self.dones[env_idx, idx].to(torch.bool))
             trunc_batches.append(self.truncations[env_idx, idx].to(torch.bool))
@@ -260,6 +301,8 @@ class SimpleReplayBuffer(nn.Module):
         observations_cpu = self._pin_tensor(torch.cat(obs_batches, dim=0))
         next_observations_cpu = self._pin_tensor(torch.cat(next_obs_batches, dim=0))
         actions_cpu = self._pin_tensor(torch.cat(action_batches, dim=0))
+        student_actions_cpu = self._pin_tensor(torch.cat(student_action_batches, dim=0))
+        teacher_intervened_cpu = self._pin_tensor(torch.cat(teacher_intervened_batches, dim=0))
         rewards_cpu = self._pin_tensor(torch.cat(reward_batches, dim=0))
         dones_cpu = self._pin_tensor(torch.cat(done_batches, dim=0))
         trunc_cpu = self._pin_tensor(torch.cat(trunc_batches, dim=0))
@@ -269,6 +312,8 @@ class SimpleReplayBuffer(nn.Module):
             observations = observations_cpu
             next_observations = next_observations_cpu
             actions = actions_cpu
+            student_actions = student_actions_cpu
+            teacher_intervened = teacher_intervened_cpu
             rewards = rewards_cpu
             dones = dones_cpu
             truncations = trunc_cpu
@@ -283,6 +328,8 @@ class SimpleReplayBuffer(nn.Module):
             observations = observations_cpu.to(self.sample_device, non_blocking=True)
             next_observations = next_observations_cpu.to(self.sample_device, non_blocking=True)
             actions = actions_cpu.to(self.sample_device, non_blocking=True)
+            student_actions = student_actions_cpu.to(self.sample_device, non_blocking=True)
+            teacher_intervened = teacher_intervened_cpu.to(self.sample_device, non_blocking=True)
             rewards = rewards_cpu.to(self.sample_device, non_blocking=True)
             dones = dones_cpu.to(self.sample_device, non_blocking=True)
             truncations = trunc_cpu.to(self.sample_device, non_blocking=True)
@@ -313,6 +360,8 @@ class SimpleReplayBuffer(nn.Module):
             {
                 "observations": observations,
                 "actions": actions,
+                "student_actions": student_actions,
+                "teacher_intervened": teacher_intervened,
                 "next": next_tensordict,
             },
             batch_size=batch_size_total,
