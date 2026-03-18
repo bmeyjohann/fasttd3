@@ -119,6 +119,16 @@ class SimpleReplayBuffer(nn.Module):
         self.ptr = 0
         self.size = 0
 
+    def linked_pref_pair_count(self) -> int:
+        total = 0
+        for env_idx in range(self.n_env):
+            cap = self.env_capacities[env_idx]
+            if cap <= 1 or self.filled[env_idx] <= 0:
+                continue
+            valid_mask = self.transition_ready[env_idx, :cap] & self.valid_next_mask[env_idx, :cap]
+            total += int((valid_mask & self.teacher_intervened[env_idx, :cap]).sum().item())
+        return total
+
     def _store_observation(self, env_idx: int, slot: int, obs_tensor: torch.Tensor) -> None:
         if self.obs_is_pixel:
             obs_uint8 = obs_tensor.mul(255.0).clamp_(0, 255).to(torch.uint8)
