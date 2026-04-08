@@ -86,6 +86,13 @@ class SimpleReplayBuffer(nn.Module):
         self.teacher_intervened = torch.zeros(
             (n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device
         )
+        # Optional EIL timing labels for the executed action at this transition.
+        self.eil_good = torch.zeros(
+            (n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device
+        )
+        self.eil_bad = torch.zeros(
+            (n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device
+        )
         self.rewards = torch.empty((n_env, self.max_capacity), dtype=torch.float32, device=self.storage_device)
         self.dones = torch.empty((n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device)
         self.truncations = torch.empty((n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device)
@@ -136,6 +143,66 @@ class SimpleReplayBuffer(nn.Module):
         else:
             self.observations[env_idx, slot].copy_(obs_tensor.to(torch.float32))
 
+    def _store_single_transition(
+        self,
+        *,
+        env_idx: int,
+        observation: torch.Tensor,
+        next_observation: torch.Tensor,
+        action: torch.Tensor,
+        student_action: torch.Tensor,
+        teacher_intervened: torch.Tensor,
+        eil_good: torch.Tensor,
+        eil_bad: torch.Tensor,
+        reward: torch.Tensor,
+        done: torch.Tensor,
+        truncation: torch.Tensor,
+        critic_observation: torch.Tensor | None = None,
+        next_critic_observation: torch.Tensor | None = None,
+    ) -> None:
+        cap = self.env_capacities[env_idx]
+        if cap <= 1:
+            return
+
+        ptr = int(self.env_ptr[env_idx].item())
+        next_slot = (ptr + 1) % cap
+
+        self._store_observation(env_idx, ptr, observation)
+        self.actions[env_idx, ptr].copy_(action.to(torch.float32))
+        self.student_actions[env_idx, ptr].copy_(student_action.to(torch.float32))
+        self.teacher_intervened[env_idx, ptr] = teacher_intervened.to(torch.bool)
+        self.eil_good[env_idx, ptr] = eil_good.to(torch.bool)
+        self.eil_bad[env_idx, ptr] = eil_bad.to(torch.bool)
+        self.rewards[env_idx, ptr] = reward.to(torch.float32)
+        self.dones[env_idx, ptr] = done.to(torch.bool)
+        self.truncations[env_idx, ptr] = truncation.to(torch.bool)
+        self.transition_ready[env_idx, ptr] = True
+
+        if self.asymmetric_obs:
+            if critic_observation is None or next_critic_observation is None:
+                raise ValueError("critic observations required for asymmetric replay buffer insert")
+            if self.playground_mode:
+                self.privileged_observations[env_idx, ptr].copy_(critic_observation.to(torch.float32))
+            else:
+                self.critic_observations[env_idx, ptr].copy_(critic_observation.to(torch.float32))
+
+        self._store_observation(env_idx, next_slot, next_observation)
+        self.valid_next_mask[env_idx, ptr] = True
+        self.transition_ready[env_idx, next_slot] = False
+        self.valid_next_mask[env_idx, next_slot] = False
+
+        if self.asymmetric_obs:
+            if self.playground_mode:
+                self.privileged_observations[env_idx, next_slot].copy_(next_critic_observation.to(torch.float32))
+            else:
+                self.critic_observations[env_idx, next_slot].copy_(next_critic_observation.to(torch.float32))
+
+        self.env_ptr[env_idx] = next_slot
+        if self.filled[env_idx] < cap:
+            self.filled[env_idx] += 1
+        self.ptr += 1
+        self.size = min(self.capacity, int(self.filled.sum().item()))
+
     @staticmethod
     def _pin_tensor(tensor: torch.Tensor) -> torch.Tensor:
         if tensor.device.type != "cpu":
@@ -175,6 +242,28 @@ class SimpleReplayBuffer(nn.Module):
             )
         else:
             teacher_intervened = torch.zeros(actions.shape[0], dtype=torch.bool, device=self.storage_device)
+        has_eil_good = False
+        try:
+            has_eil_good = "eil_good" in tensor_dict.keys(include_nested=False)
+        except TypeError:
+            has_eil_good = "eil_good" in tensor_dict.keys()
+        except Exception:
+            has_eil_good = "eil_good" in tensor_dict
+        if has_eil_good:
+            eil_good = tensor_dict["eil_good"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+        else:
+            eil_good = torch.zeros(actions.shape[0], dtype=torch.bool, device=self.storage_device)
+        has_eil_bad = False
+        try:
+            has_eil_bad = "eil_bad" in tensor_dict.keys(include_nested=False)
+        except TypeError:
+            has_eil_bad = "eil_bad" in tensor_dict.keys()
+        except Exception:
+            has_eil_bad = "eil_bad" in tensor_dict
+        if has_eil_bad:
+            eil_bad = tensor_dict["eil_bad"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+        else:
+            eil_bad = torch.zeros(actions.shape[0], dtype=torch.bool, device=self.storage_device)
         rewards = tensor_dict["next"]["rewards"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
         dones = tensor_dict["next"]["dones"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
         truncations = (
@@ -205,45 +294,118 @@ class SimpleReplayBuffer(nn.Module):
                 next_critic_obs = next_critic_obs.view(self.n_env, -1)
 
         for env_idx in range(self.n_env):
-            cap = self.env_capacities[env_idx]
-            if cap <= 1:
-                continue
+            critic_obs_env = critic_obs[env_idx] if self.asymmetric_obs else None
+            next_critic_obs_env = next_critic_obs[env_idx] if self.asymmetric_obs else None
+            self._store_single_transition(
+                env_idx=env_idx,
+                observation=observations[env_idx],
+                next_observation=next_observations[env_idx],
+                action=actions[env_idx],
+                student_action=student_actions[env_idx],
+                teacher_intervened=teacher_intervened[env_idx],
+                eil_good=eil_good[env_idx],
+                eil_bad=eil_bad[env_idx],
+                reward=rewards[env_idx],
+                done=dones[env_idx],
+                truncation=truncations[env_idx],
+                critic_observation=critic_obs_env,
+                next_critic_observation=next_critic_obs_env,
+            )
 
-            ptr = int(self.env_ptr[env_idx].item())
-            next_slot = (ptr + 1) % cap
+    def extend_single_env(self, env_idx: int, tensor_dict: TensorDict) -> None:
+        if env_idx < 0 or env_idx >= self.n_env:
+            raise IndexError(f"env_idx {env_idx} out of range for replay buffer with n_env={self.n_env}")
 
-            self._store_observation(env_idx, ptr, observations[env_idx])
-            self.actions[env_idx, ptr].copy_(actions[env_idx])
-            self.student_actions[env_idx, ptr].copy_(student_actions[env_idx])
-            self.teacher_intervened[env_idx, ptr] = teacher_intervened[env_idx]
-            self.rewards[env_idx, ptr] = rewards[env_idx]
-            self.dones[env_idx, ptr] = dones[env_idx]
-            self.truncations[env_idx, ptr] = truncations[env_idx]
-            self.transition_ready[env_idx, ptr] = True
+        observations = tensor_dict["observations"].detach().to(self.storage_device, non_blocking=True)
+        next_observations = tensor_dict["next"]["observations"].detach().to(self.storage_device, non_blocking=True)
+        actions = tensor_dict["actions"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
+        try:
+            has_student_actions = "student_actions" in tensor_dict.keys(include_nested=False)
+        except TypeError:
+            has_student_actions = "student_actions" in tensor_dict.keys()
+        except Exception:
+            has_student_actions = "student_actions" in tensor_dict
+        if has_student_actions:
+            student_actions = tensor_dict["student_actions"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
+        else:
+            student_actions = actions
+        try:
+            has_teacher_intervened = "teacher_intervened" in tensor_dict.keys(include_nested=False)
+        except TypeError:
+            has_teacher_intervened = "teacher_intervened" in tensor_dict.keys()
+        except Exception:
+            has_teacher_intervened = "teacher_intervened" in tensor_dict
+        if has_teacher_intervened:
+            teacher_intervened = tensor_dict["teacher_intervened"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+        else:
+            teacher_intervened = torch.zeros(1, dtype=torch.bool, device=self.storage_device)
+        try:
+            has_eil_good = "eil_good" in tensor_dict.keys(include_nested=False)
+        except TypeError:
+            has_eil_good = "eil_good" in tensor_dict.keys()
+        except Exception:
+            has_eil_good = "eil_good" in tensor_dict
+        if has_eil_good:
+            eil_good = tensor_dict["eil_good"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+        else:
+            eil_good = torch.zeros(1, dtype=torch.bool, device=self.storage_device)
+        try:
+            has_eil_bad = "eil_bad" in tensor_dict.keys(include_nested=False)
+        except TypeError:
+            has_eil_bad = "eil_bad" in tensor_dict.keys()
+        except Exception:
+            has_eil_bad = "eil_bad" in tensor_dict
+        if has_eil_bad:
+            eil_bad = tensor_dict["eil_bad"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+        else:
+            eil_bad = torch.zeros(1, dtype=torch.bool, device=self.storage_device)
+        rewards = tensor_dict["next"]["rewards"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
+        dones = tensor_dict["next"]["dones"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+        truncations = tensor_dict["next"]["truncations"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
 
-            if self.asymmetric_obs:
-                if self.playground_mode:
-                    self.privileged_observations[env_idx, ptr].copy_(critic_obs[env_idx])
-                else:
-                    self.critic_observations[env_idx, ptr].copy_(critic_obs[env_idx])
+        if self.obs_is_pixel:
+            observations = observations.view(-1, *self.pixel_shape)[0]
+            next_observations = next_observations.view(-1, *self.pixel_shape)[0]
+        else:
+            observations = observations.view(-1, self.obs_flat_dim)[0]
+            next_observations = next_observations.view(-1, self.obs_flat_dim)[0]
 
-            self._store_observation(env_idx, next_slot, next_observations[env_idx])
-            self.valid_next_mask[env_idx, ptr] = True
-            self.transition_ready[env_idx, next_slot] = False
-            self.valid_next_mask[env_idx, next_slot] = False
+        action = actions.view(-1, self.n_act)[0]
+        student_action = student_actions.view(-1, self.n_act)[0]
+        teacher_intervened_scalar = teacher_intervened.view(-1)[0]
+        eil_good_scalar = eil_good.view(-1)[0]
+        eil_bad_scalar = eil_bad.view(-1)[0]
+        reward_scalar = rewards.view(-1)[0]
+        done_scalar = dones.view(-1)[0]
+        trunc_scalar = truncations.view(-1)[0]
 
-            if self.asymmetric_obs:
-                if self.playground_mode:
-                    self.privileged_observations[env_idx, next_slot].copy_(next_critic_obs[env_idx])
-                else:
-                    self.critic_observations[env_idx, next_slot].copy_(next_critic_obs[env_idx])
+        critic_obs = None
+        next_critic_obs = None
+        if self.asymmetric_obs:
+            critic_obs_raw = tensor_dict["critic_observations"].detach().to(self.storage_device, non_blocking=True)
+            next_critic_obs_raw = tensor_dict["next"]["critic_observations"].detach().to(self.storage_device, non_blocking=True)
+            if self.playground_mode:
+                critic_obs = critic_obs_raw.view(-1, critic_obs_raw.shape[-1])[0][self.n_obs :]
+                next_critic_obs = next_critic_obs_raw.view(-1, next_critic_obs_raw.shape[-1])[0][self.n_obs :]
+            else:
+                critic_obs = critic_obs_raw.view(-1, critic_obs_raw.shape[-1])[0]
+                next_critic_obs = next_critic_obs_raw.view(-1, next_critic_obs_raw.shape[-1])[0]
 
-            self.env_ptr[env_idx] = next_slot
-            if self.filled[env_idx] < cap:
-                self.filled[env_idx] += 1
-
-        self.ptr += self.n_env
-        self.size = min(self.capacity, int(self.filled.sum().item()))
+        self._store_single_transition(
+            env_idx=env_idx,
+            observation=observations,
+            next_observation=next_observations,
+            action=action,
+            student_action=student_action,
+            teacher_intervened=teacher_intervened_scalar,
+            eil_good=eil_good_scalar,
+            eil_bad=eil_bad_scalar,
+            reward=reward_scalar,
+            done=done_scalar,
+            truncation=trunc_scalar,
+            critic_observation=critic_obs,
+            next_critic_observation=next_critic_obs,
+        )
 
     def _gather_observations(self, env_idx: int, indices: torch.Tensor) -> torch.Tensor:
         obs = self.observations[env_idx, indices]
@@ -270,6 +432,8 @@ class SimpleReplayBuffer(nn.Module):
         action_batches = []
         student_action_batches = []
         teacher_intervened_batches = []
+        eil_good_batches = []
+        eil_bad_batches = []
         reward_batches = []
         done_batches = []
         trunc_batches = []
@@ -297,6 +461,8 @@ class SimpleReplayBuffer(nn.Module):
             action_batches.append(self.actions[env_idx, idx].to(torch.float32))
             student_action_batches.append(self.student_actions[env_idx, idx].to(torch.float32))
             teacher_intervened_batches.append(self.teacher_intervened[env_idx, idx].to(torch.bool))
+            eil_good_batches.append(self.eil_good[env_idx, idx].to(torch.bool))
+            eil_bad_batches.append(self.eil_bad[env_idx, idx].to(torch.bool))
             reward_batches.append(self.rewards[env_idx, idx])
             done_batches.append(self.dones[env_idx, idx].to(torch.bool))
             trunc_batches.append(self.truncations[env_idx, idx].to(torch.bool))
@@ -313,6 +479,8 @@ class SimpleReplayBuffer(nn.Module):
         actions_cpu = self._pin_tensor(torch.cat(action_batches, dim=0))
         student_actions_cpu = self._pin_tensor(torch.cat(student_action_batches, dim=0))
         teacher_intervened_cpu = self._pin_tensor(torch.cat(teacher_intervened_batches, dim=0))
+        eil_good_cpu = self._pin_tensor(torch.cat(eil_good_batches, dim=0))
+        eil_bad_cpu = self._pin_tensor(torch.cat(eil_bad_batches, dim=0))
         rewards_cpu = self._pin_tensor(torch.cat(reward_batches, dim=0))
         dones_cpu = self._pin_tensor(torch.cat(done_batches, dim=0))
         trunc_cpu = self._pin_tensor(torch.cat(trunc_batches, dim=0))
@@ -324,6 +492,8 @@ class SimpleReplayBuffer(nn.Module):
             actions = actions_cpu
             student_actions = student_actions_cpu
             teacher_intervened = teacher_intervened_cpu
+            eil_good = eil_good_cpu
+            eil_bad = eil_bad_cpu
             rewards = rewards_cpu
             dones = dones_cpu
             truncations = trunc_cpu
@@ -340,6 +510,8 @@ class SimpleReplayBuffer(nn.Module):
             actions = actions_cpu.to(self.sample_device, non_blocking=True)
             student_actions = student_actions_cpu.to(self.sample_device, non_blocking=True)
             teacher_intervened = teacher_intervened_cpu.to(self.sample_device, non_blocking=True)
+            eil_good = eil_good_cpu.to(self.sample_device, non_blocking=True)
+            eil_bad = eil_bad_cpu.to(self.sample_device, non_blocking=True)
             rewards = rewards_cpu.to(self.sample_device, non_blocking=True)
             dones = dones_cpu.to(self.sample_device, non_blocking=True)
             truncations = trunc_cpu.to(self.sample_device, non_blocking=True)
@@ -372,6 +544,8 @@ class SimpleReplayBuffer(nn.Module):
                 "actions": actions,
                 "student_actions": student_actions,
                 "teacher_intervened": teacher_intervened,
+                "eil_good": eil_good,
+                "eil_bad": eil_bad,
                 "next": next_tensordict,
             },
             batch_size=batch_size_total,
