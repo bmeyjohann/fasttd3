@@ -212,10 +212,24 @@ class SimpleReplayBuffer(nn.Module):
         except RuntimeError:
             return tensor
 
+    def _to_storage_tensor(self, tensor: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+        """
+        Stage a tensor onto the replay-storage device.
+
+        The replay buffer stores data on CPU and consumes it immediately after the
+        transfer during insertion. CUDA -> CPU copies therefore must be blocking;
+        otherwise tiny scalar/bool tensors can be observed before the async copy
+        completes, which corrupts intervention / done flags in single-env runs.
+        """
+        out = tensor.detach().to(self.storage_device, non_blocking=False)
+        if dtype is not None:
+            out = out.to(dtype)
+        return out
+
     def extend(self, tensor_dict: TensorDict) -> None:
-        observations = tensor_dict["observations"].detach().to(self.storage_device, non_blocking=True)
-        next_observations = tensor_dict["next"]["observations"].detach().to(self.storage_device, non_blocking=True)
-        actions = tensor_dict["actions"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
+        observations = self._to_storage_tensor(tensor_dict["observations"])
+        next_observations = self._to_storage_tensor(tensor_dict["next"]["observations"])
+        actions = self._to_storage_tensor(tensor_dict["actions"], dtype=torch.float32)
         has_student_actions = False
         try:
             has_student_actions = "student_actions" in tensor_dict.keys(include_nested=False)
@@ -224,8 +238,8 @@ class SimpleReplayBuffer(nn.Module):
         except Exception:
             has_student_actions = "student_actions" in tensor_dict
         if has_student_actions:
-            student_actions = (
-                tensor_dict["student_actions"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
+            student_actions = self._to_storage_tensor(
+                tensor_dict["student_actions"], dtype=torch.float32
             )
         else:
             student_actions = actions
@@ -237,8 +251,8 @@ class SimpleReplayBuffer(nn.Module):
         except Exception:
             has_teacher_intervened = "teacher_intervened" in tensor_dict
         if has_teacher_intervened:
-            teacher_intervened = (
-                tensor_dict["teacher_intervened"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+            teacher_intervened = self._to_storage_tensor(
+                tensor_dict["teacher_intervened"], dtype=torch.bool
             )
         else:
             teacher_intervened = torch.zeros(actions.shape[0], dtype=torch.bool, device=self.storage_device)
@@ -250,7 +264,7 @@ class SimpleReplayBuffer(nn.Module):
         except Exception:
             has_eil_good = "eil_good" in tensor_dict
         if has_eil_good:
-            eil_good = tensor_dict["eil_good"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+            eil_good = self._to_storage_tensor(tensor_dict["eil_good"], dtype=torch.bool)
         else:
             eil_good = torch.zeros(actions.shape[0], dtype=torch.bool, device=self.storage_device)
         has_eil_bad = False
@@ -261,14 +275,12 @@ class SimpleReplayBuffer(nn.Module):
         except Exception:
             has_eil_bad = "eil_bad" in tensor_dict
         if has_eil_bad:
-            eil_bad = tensor_dict["eil_bad"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+            eil_bad = self._to_storage_tensor(tensor_dict["eil_bad"], dtype=torch.bool)
         else:
             eil_bad = torch.zeros(actions.shape[0], dtype=torch.bool, device=self.storage_device)
-        rewards = tensor_dict["next"]["rewards"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
-        dones = tensor_dict["next"]["dones"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
-        truncations = (
-            tensor_dict["next"]["truncations"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
-        )
+        rewards = self._to_storage_tensor(tensor_dict["next"]["rewards"], dtype=torch.float32)
+        dones = self._to_storage_tensor(tensor_dict["next"]["dones"], dtype=torch.bool)
+        truncations = self._to_storage_tensor(tensor_dict["next"]["truncations"], dtype=torch.bool)
 
         if self.obs_is_pixel:
             observations = observations.view(self.n_env, *self.pixel_shape)
@@ -279,17 +291,13 @@ class SimpleReplayBuffer(nn.Module):
 
         if self.asymmetric_obs:
             if self.playground_mode:
-                critic_obs = tensor_dict["critic_observations"].detach().to(self.storage_device, non_blocking=True)
-                next_critic_obs = tensor_dict["next"]["critic_observations"].detach().to(
-                    self.storage_device, non_blocking=True
-                )
+                critic_obs = self._to_storage_tensor(tensor_dict["critic_observations"])
+                next_critic_obs = self._to_storage_tensor(tensor_dict["next"]["critic_observations"])
                 critic_obs = critic_obs.view(self.n_env, -1)[:, self.n_obs :]
                 next_critic_obs = next_critic_obs.view(self.n_env, -1)[:, self.n_obs :]
             else:
-                critic_obs = tensor_dict["critic_observations"].detach().to(self.storage_device, non_blocking=True)
-                next_critic_obs = tensor_dict["next"]["critic_observations"].detach().to(
-                    self.storage_device, non_blocking=True
-                )
+                critic_obs = self._to_storage_tensor(tensor_dict["critic_observations"])
+                next_critic_obs = self._to_storage_tensor(tensor_dict["next"]["critic_observations"])
                 critic_obs = critic_obs.view(self.n_env, -1)
                 next_critic_obs = next_critic_obs.view(self.n_env, -1)
 
@@ -316,9 +324,9 @@ class SimpleReplayBuffer(nn.Module):
         if env_idx < 0 or env_idx >= self.n_env:
             raise IndexError(f"env_idx {env_idx} out of range for replay buffer with n_env={self.n_env}")
 
-        observations = tensor_dict["observations"].detach().to(self.storage_device, non_blocking=True)
-        next_observations = tensor_dict["next"]["observations"].detach().to(self.storage_device, non_blocking=True)
-        actions = tensor_dict["actions"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
+        observations = self._to_storage_tensor(tensor_dict["observations"])
+        next_observations = self._to_storage_tensor(tensor_dict["next"]["observations"])
+        actions = self._to_storage_tensor(tensor_dict["actions"], dtype=torch.float32)
         try:
             has_student_actions = "student_actions" in tensor_dict.keys(include_nested=False)
         except TypeError:
@@ -326,7 +334,9 @@ class SimpleReplayBuffer(nn.Module):
         except Exception:
             has_student_actions = "student_actions" in tensor_dict
         if has_student_actions:
-            student_actions = tensor_dict["student_actions"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
+            student_actions = self._to_storage_tensor(
+                tensor_dict["student_actions"], dtype=torch.float32
+            )
         else:
             student_actions = actions
         try:
@@ -336,7 +346,9 @@ class SimpleReplayBuffer(nn.Module):
         except Exception:
             has_teacher_intervened = "teacher_intervened" in tensor_dict
         if has_teacher_intervened:
-            teacher_intervened = tensor_dict["teacher_intervened"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+            teacher_intervened = self._to_storage_tensor(
+                tensor_dict["teacher_intervened"], dtype=torch.bool
+            )
         else:
             teacher_intervened = torch.zeros(1, dtype=torch.bool, device=self.storage_device)
         try:
@@ -346,7 +358,7 @@ class SimpleReplayBuffer(nn.Module):
         except Exception:
             has_eil_good = "eil_good" in tensor_dict
         if has_eil_good:
-            eil_good = tensor_dict["eil_good"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+            eil_good = self._to_storage_tensor(tensor_dict["eil_good"], dtype=torch.bool)
         else:
             eil_good = torch.zeros(1, dtype=torch.bool, device=self.storage_device)
         try:
@@ -356,12 +368,12 @@ class SimpleReplayBuffer(nn.Module):
         except Exception:
             has_eil_bad = "eil_bad" in tensor_dict
         if has_eil_bad:
-            eil_bad = tensor_dict["eil_bad"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+            eil_bad = self._to_storage_tensor(tensor_dict["eil_bad"], dtype=torch.bool)
         else:
             eil_bad = torch.zeros(1, dtype=torch.bool, device=self.storage_device)
-        rewards = tensor_dict["next"]["rewards"].detach().to(self.storage_device, non_blocking=True).to(torch.float32)
-        dones = tensor_dict["next"]["dones"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
-        truncations = tensor_dict["next"]["truncations"].detach().to(self.storage_device, non_blocking=True).to(torch.bool)
+        rewards = self._to_storage_tensor(tensor_dict["next"]["rewards"], dtype=torch.float32)
+        dones = self._to_storage_tensor(tensor_dict["next"]["dones"], dtype=torch.bool)
+        truncations = self._to_storage_tensor(tensor_dict["next"]["truncations"], dtype=torch.bool)
 
         if self.obs_is_pixel:
             observations = observations.view(-1, *self.pixel_shape)[0]
@@ -382,8 +394,8 @@ class SimpleReplayBuffer(nn.Module):
         critic_obs = None
         next_critic_obs = None
         if self.asymmetric_obs:
-            critic_obs_raw = tensor_dict["critic_observations"].detach().to(self.storage_device, non_blocking=True)
-            next_critic_obs_raw = tensor_dict["next"]["critic_observations"].detach().to(self.storage_device, non_blocking=True)
+            critic_obs_raw = self._to_storage_tensor(tensor_dict["critic_observations"])
+            next_critic_obs_raw = self._to_storage_tensor(tensor_dict["next"]["critic_observations"])
             if self.playground_mode:
                 critic_obs = critic_obs_raw.view(-1, critic_obs_raw.shape[-1])[0][self.n_obs :]
                 next_critic_obs = next_critic_obs_raw.view(-1, next_critic_obs_raw.shape[-1])[0][self.n_obs :]
