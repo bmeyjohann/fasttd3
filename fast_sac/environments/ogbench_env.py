@@ -18,12 +18,14 @@ class OGBenchVecEnvAdapter:
         device: torch.device,
         wrappers: Optional[List[Callable]] = None,
         clip_actions: Optional[float] = 1.0,
+        seed: Optional[int] = None,
         **env_kwargs,
     ):
         self.device = device
         self.env_name = env_name
         self._wrappers = wrappers or []
         self._env_kwargs = env_kwargs
+        self._seed = None if seed is None else int(seed)
         self._env = VectorizedOGBenchEnv(
             env_name=env_name,
             num_envs=num_envs,
@@ -32,6 +34,8 @@ class OGBenchVecEnvAdapter:
             auto_reset_on_init=False,
             **env_kwargs,
         )
+        if self._seed is not None and hasattr(self._env, "seed"):
+            self._env.seed(self._seed)
         # Mirror attributes expected by fast_sac
         self.num_envs = self._env.num_envs
         self.num_obs = self._env.num_obs
@@ -112,3 +116,9 @@ class OGBenchVecEnvAdapter:
     def close(self) -> None:
         if hasattr(self._env, "close"):
             self._env.close()
+
+    def seed(self, seed: int) -> int:
+        self._seed = int(seed)
+        if hasattr(self._env, "seed"):
+            return int(self._env.seed(self._seed))
+        return self._seed

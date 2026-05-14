@@ -86,6 +86,18 @@ class SimpleReplayBuffer(nn.Module):
         self.teacher_intervened = torch.zeros(
             (n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device
         )
+        # Per-replay-row dual state for linked preference Lagrangians. Values are
+        # initialized lazily from the train args when a row is first sampled.
+        self.pref_lambdas = torch.empty(
+            (n_env, self.max_capacity), dtype=torch.float32, device=self.storage_device
+        )
+        self.pref_lambdas.fill_(float("nan"))
+        self.pref_violation_emas = torch.zeros(
+            (n_env, self.max_capacity), dtype=torch.float32, device=self.storage_device
+        )
+        self.pref_lambda_initialized = torch.zeros(
+            (n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device
+        )
         # Optional EIL timing labels for the executed action at this transition.
         self.eil_good = torch.zeros(
             (n_env, self.max_capacity), dtype=torch.bool, device=self.storage_device
@@ -171,6 +183,9 @@ class SimpleReplayBuffer(nn.Module):
         self.actions[env_idx, ptr].copy_(action.to(torch.float32))
         self.student_actions[env_idx, ptr].copy_(student_action.to(torch.float32))
         self.teacher_intervened[env_idx, ptr] = teacher_intervened.to(torch.bool)
+        self.pref_lambdas[env_idx, ptr] = float("nan")
+        self.pref_violation_emas[env_idx, ptr] = 0.0
+        self.pref_lambda_initialized[env_idx, ptr] = False
         self.eil_good[env_idx, ptr] = eil_good.to(torch.bool)
         self.eil_bad[env_idx, ptr] = eil_bad.to(torch.bool)
         self.rewards[env_idx, ptr] = reward.to(torch.float32)
@@ -435,6 +450,44 @@ class SimpleReplayBuffer(nn.Module):
             return torch.cat([obs, priv], dim=-1)
         return self.critic_observations[env_idx, indices].to(torch.float32)
 
+    def gather_pref_lagrangian_state(
+        self,
+        env_indices: torch.Tensor,
+        slot_indices: torch.Tensor,
+        *,
+        init_lambda: float,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        env_cpu = env_indices.detach().to(self.storage_device, dtype=torch.long)
+        slot_cpu = slot_indices.detach().to(self.storage_device, dtype=torch.long)
+        lambdas = self.pref_lambdas[env_cpu, slot_cpu]
+        emas = self.pref_violation_emas[env_cpu, slot_cpu]
+        initialized = self.pref_lambda_initialized[env_cpu, slot_cpu]
+        init = torch.full_like(lambdas, float(init_lambda))
+        lambdas = torch.where(initialized & torch.isfinite(lambdas), lambdas, init)
+        emas = torch.where(initialized, emas, torch.zeros_like(emas))
+        return (
+            lambdas.to(device=device, non_blocking=True),
+            emas.to(device=device, non_blocking=True),
+            initialized.to(device=device, non_blocking=True),
+        )
+
+    def update_pref_lagrangian_state(
+        self,
+        env_indices: torch.Tensor,
+        slot_indices: torch.Tensor,
+        *,
+        lambdas: torch.Tensor,
+        violation_emas: torch.Tensor,
+    ) -> None:
+        env_cpu = env_indices.detach().to(self.storage_device, dtype=torch.long)
+        slot_cpu = slot_indices.detach().to(self.storage_device, dtype=torch.long)
+        lambda_cpu = lambdas.detach().to(self.storage_device, dtype=torch.float32)
+        ema_cpu = violation_emas.detach().to(self.storage_device, dtype=torch.float32)
+        self.pref_lambdas[env_cpu, slot_cpu] = lambda_cpu
+        self.pref_violation_emas[env_cpu, slot_cpu] = ema_cpu
+        self.pref_lambda_initialized[env_cpu, slot_cpu] = True
+
     def sample(self, batch_size: int) -> TensorDict:
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
@@ -444,6 +497,8 @@ class SimpleReplayBuffer(nn.Module):
         action_batches = []
         student_action_batches = []
         teacher_intervened_batches = []
+        env_index_batches = []
+        buffer_index_batches = []
         eil_good_batches = []
         eil_bad_batches = []
         reward_batches = []
@@ -473,6 +528,8 @@ class SimpleReplayBuffer(nn.Module):
             action_batches.append(self.actions[env_idx, idx].to(torch.float32))
             student_action_batches.append(self.student_actions[env_idx, idx].to(torch.float32))
             teacher_intervened_batches.append(self.teacher_intervened[env_idx, idx].to(torch.bool))
+            env_index_batches.append(torch.full_like(idx, int(env_idx), dtype=torch.long))
+            buffer_index_batches.append(idx.to(torch.long))
             eil_good_batches.append(self.eil_good[env_idx, idx].to(torch.bool))
             eil_bad_batches.append(self.eil_bad[env_idx, idx].to(torch.bool))
             reward_batches.append(self.rewards[env_idx, idx])
@@ -491,6 +548,8 @@ class SimpleReplayBuffer(nn.Module):
         actions_cpu = self._pin_tensor(torch.cat(action_batches, dim=0))
         student_actions_cpu = self._pin_tensor(torch.cat(student_action_batches, dim=0))
         teacher_intervened_cpu = self._pin_tensor(torch.cat(teacher_intervened_batches, dim=0))
+        env_indices_cpu = self._pin_tensor(torch.cat(env_index_batches, dim=0))
+        buffer_indices_cpu = self._pin_tensor(torch.cat(buffer_index_batches, dim=0))
         eil_good_cpu = self._pin_tensor(torch.cat(eil_good_batches, dim=0))
         eil_bad_cpu = self._pin_tensor(torch.cat(eil_bad_batches, dim=0))
         rewards_cpu = self._pin_tensor(torch.cat(reward_batches, dim=0))
@@ -504,6 +563,8 @@ class SimpleReplayBuffer(nn.Module):
             actions = actions_cpu
             student_actions = student_actions_cpu
             teacher_intervened = teacher_intervened_cpu
+            env_indices = env_indices_cpu
+            buffer_indices = buffer_indices_cpu
             eil_good = eil_good_cpu
             eil_bad = eil_bad_cpu
             rewards = rewards_cpu
@@ -522,6 +583,8 @@ class SimpleReplayBuffer(nn.Module):
             actions = actions_cpu.to(self.sample_device, non_blocking=True)
             student_actions = student_actions_cpu.to(self.sample_device, non_blocking=True)
             teacher_intervened = teacher_intervened_cpu.to(self.sample_device, non_blocking=True)
+            env_indices = env_indices_cpu.to(self.sample_device, non_blocking=True)
+            buffer_indices = buffer_indices_cpu.to(self.sample_device, non_blocking=True)
             eil_good = eil_good_cpu.to(self.sample_device, non_blocking=True)
             eil_bad = eil_bad_cpu.to(self.sample_device, non_blocking=True)
             rewards = rewards_cpu.to(self.sample_device, non_blocking=True)
@@ -556,6 +619,8 @@ class SimpleReplayBuffer(nn.Module):
                 "actions": actions,
                 "student_actions": student_actions,
                 "teacher_intervened": teacher_intervened,
+                "replay_env_indices": env_indices,
+                "replay_buffer_indices": buffer_indices,
                 "eil_good": eil_good,
                 "eil_bad": eil_bad,
                 "next": next_tensordict,
